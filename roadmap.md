@@ -91,17 +91,51 @@ Edit → Test → Profile → Benchmark → Repeat.
 
 ---
 
+## Fused MoE: What Fusion Actually Means
+
+A naive MoE pass goes HBM → op → HBM → op → HBM for every intermediate. Fusion keeps data in registers or shared memory across op boundaries, eliminating round-trips:
+
+| Fusion Boundary | What Stays On-Chip | HBM Traffic Eliminated |
+|---|---|---|
+| FP8 dequant → GEMM | Scale × tile result in registers | Pre-dequantized weight tensors (~2GB) |
+| GEMM1 epilogue → SwiGLU | Output tile before store | GEMM1 output buffer |
+| GEMM2 epilogue → scatter-add | Output row before store | GEMM2 output buffer |
+| All experts in one grid | Expert metadata, token indices | 32×2 kernel launch overhead |
+
+The GEMM epilogue is the natural fusion point: each output tile is computed entirely in registers before the store instruction. Elementwise ops (SwiGLU, scale, accumulate) applied *before* the store are "free" in terms of memory traffic.
+
+## Triton vs CUDA for This Project
+
+**Triton teaches**: tile-based thinking, memory hierarchy intuition, how fused algorithms are structured — all directly transferable.
+
+**Triton hides**: explicit shared memory, warp-level primitives (`__shfl_sync`, WMMA), TMA (Tensor Memory Accelerator), WGMMA (warpgroup MMA on Hopper/Blackwell), CTA cluster programming, pipeline staging.
+
+**For B200, the highest-value hardware features are:**
+- **TMA** — hardware fetches tiles into smem asynchronously while compute runs
+- **WGMMA** — warpgroup MMA operating on smem tiles directly (what makes H100/B200 GEMM fast)
+- **Persistent warp specialization** — producer warps load while consumer warps compute, pipelined
+
+These are only accessible via CUDA/PTX. Use Triton to validate the algorithm and understand fusion structure, then move to CUTLASS/CuTe for peak B200 utilization.
+
 ## Optimization Roadmap
 
 | | Phase | Tool | What | Key Win |
 |---|-------|------|------|---------|
 | ✅ | 0. Baseline | PyTorch | Reference impl, 200+ kernel launches | Correctness ground truth |
 | ✅ | 1. Skeleton | Triton + PyTorch | Token sort by expert, Triton scatter-add, still `torch.matmul` | Structured permutation |
-| ⬜ | 2. Fused FP8 GEMM | Triton | Fuse block-scale dequant into GEMM K-loop (`BLOCK_K=128=BLOCK_SCALE`) | Eliminate pre-dequant tensors (~2GB) |
-| ⬜ | 3. Fuse SwiGLU | Triton | Compute SwiGLU in registers in GEMM1 epilogue | Half mem traffic between GEMM1→GEMM2 |
-| ⬜ | 4. Single grid | Triton | One kernel grid over all experts, binary-search expert boundaries | 32×2 launches → 2 launches |
+| ⬜ | 2. Fused FP8 GEMM | Triton | Wire up `_gemm_fp8_blockscale`; pass FP8 tensors to `tl.dot` directly (not .to(fp32)); eliminate Python expert loop + pre-dequant | Eliminate ~2GB intermediate tensors; use hardware FP8 tensor cores |
+| ⬜ | 3. Fuse SwiGLU epilogue | Triton | Compute SwiGLU in registers inside GEMM1 epilogue before store | Eliminate GEMM1 output buffer, halve mem traffic GEMM1→GEMM2 |
+| ⬜ | 4. Single grid + fuse scatter-add | Triton | One kernel grid over all experts (keyed by expert_id × tile_m × tile_n); fuse weighted scatter-add into GEMM2 epilogue | 32×2 launches → 2 launches; eliminate GEMM2 output buffer |
 | ⬜ | 5. Fuse routing | Triton | Triton kernel for sigmoid→group-topk→global-topk→permutation | Remove PyTorch routing overhead |
-| ⬜ | 6. HW-specific | CUDA/CUTLASS/CuTe | TMA, warp specialization, persistent kernel, GEMM2 epilogue fused scatter-add | Peak Blackwell utilization |
-| ⬜ | 7. Tune | Triton/CUDA | Autotune tile sizes, pad expert batches, L2 cache reorder, stream overlap | Squeeze last 10-30% |
+| ⬜ | 6. CUTLASS grouped GEMM | CUDA/CUTLASS 3.x | Drop in CUTLASS grouped GEMM with TMA + WGMMA; fuse SwiGLU + scatter-add in custom epilogue | Near-peak Blackwell utilization without full custom CUDA |
+| ⬜ | 7. Custom CUDA kernel | CUDA/CuTe | Persistent warp-specialized kernel; producer warps do TMA loads, consumer warps do WGMMA; fused epilogue with scatter-add | Full control, peak throughput |
+| ⬜ | 8. Tune | CUDA | Autotune tile sizes, pad expert batches to BLOCK_M, L2 cache reorder, stream overlap | Last 10-30% |
+
+## Expert Token Batching Problem
+
+With T≤256 tokens and 32 experts (top-8 routing), average tokens per expert ≈ 64 for T=256, but can be 0 for T=1. Small M severely underutilizes tensor cores. Mitigations:
+- Pad expert batches to minimum `BLOCK_M` (wastes compute, fills pipeline)
+- Stream-K decomposition (CUTLASS feature): splits K dimension across SMs for load balancing
+- Group small experts together into one tile (complex but avoids padding waste)
 
 ---
