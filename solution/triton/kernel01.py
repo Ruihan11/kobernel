@@ -168,9 +168,6 @@ def _scatter_add_weighted(
     pid_tok = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    if pid_tok >= total_tokens:
-        return
-
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offs_h < H_val
 
@@ -182,7 +179,7 @@ def _scatter_add_weighted(
     w = tl.load(Weight_ptr + pid_tok).to(tl.float32)
 
     # Load target token index
-    tok_idx = tl.load(TokenIdx_ptr + pid_tok)
+    tok_idx = tl.load(TokenIdx_ptr + pid_tok).to(tl.int32)
 
     # Atomic add to output
     o_ptrs = Output_ptr + tok_idx * stride_om + offs_h * stride_oh
@@ -254,6 +251,7 @@ def kernel(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor = None,
 ):
     H = 7168
     I = 2048
@@ -287,6 +285,9 @@ def kernel(
     local_expert_local = local_expert_flat - local_start  # local expert indices [0, E_LOCAL)
 
     if local_expert_flat.numel() == 0:
+        if output is not None:
+            output.zero_()
+            return
         return torch.zeros((T, H), dtype=torch.bfloat16, device=device)
 
     # Sort by local expert for grouped processing
@@ -358,17 +359,21 @@ def kernel(
         result_buf[start:end] = O
 
     # ------- 5. Weighted scatter-add -------
-    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    out_buf = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     # Use Triton scatter-add for atomic accumulation
     BLOCK_H = 128
     grid_scatter = (total_tokens, triton.cdiv(H, BLOCK_H))
     _scatter_add_weighted[grid_scatter](
-        result_buf, sorted_weight, sorted_token, output,
+        result_buf, sorted_weight, sorted_token, out_buf,
         total_tokens, H,
         result_buf.stride(0), result_buf.stride(1),
-        output.stride(0), output.stride(1),
+        out_buf.stride(0), out_buf.stride(1),
         BLOCK_H=BLOCK_H,
     )
 
-    return output.to(torch.bfloat16)
+    result = out_buf.to(torch.bfloat16)
+    if output is not None:
+        output.copy_(result)
+        return
+    return result

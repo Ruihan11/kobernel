@@ -29,19 +29,19 @@ The kernel implements a fused Mixture-of-Experts layer with:
 ```bash
 # Reference self-check
 python tests/test_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py \
-    --ref "solution/python/kernel.py::kernel" \
-    --test "solution/python/kernel.py::kernel"
+    --ref "solution/python/kernel00.py::kernel" \
+    --test "solution/python/kernel00.py::kernel"
 
 # Triton vs reference
 python tests/test_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py \
-    --ref "solution/python/kernel.py::kernel" \
-    --test "solution/triton/kernel.py::kernel" \
+    --ref "solution/python/kernel00.py::kernel" \
+    --test "solution/triton/kernel01.py::kernel" \
     --device cuda
 
 # Sweep across batch sizes
 python tests/test_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py \
-    --ref "solution/python/kernel.py::kernel" \
-    --test "solution/triton/kernel.py::kernel" \
+    --ref "solution/python/kernel00.py::kernel" \
+    --test "solution/triton/kernel01.py::kernel" \
     --device cuda --T 1 4 16 64 256
 ```
 
