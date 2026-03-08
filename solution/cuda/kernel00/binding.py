@@ -1,14 +1,18 @@
 """
-Python binding for CUDA MoE kernel.
+Python binding for optimized CUDA MoE kernel.
 
-Compiles kernel.cu via torch.utils.cpp_extension.load() and provides the
-kernel() entry point. Routing and weight dequant run in PyTorch; SwiGLU,
-scatter-add, and activation dequant+gather use custom CUDA kernels.
+Compiles kernel.cu via torch.utils.cpp_extension.load(). Routing runs in
+PyTorch; everything else (weight dequant, GEMM, SwiGLU, scatter-add) runs
+in a single C++ call with cuBLAS and custom CUDA kernels.
+
+Optimizations over baseline:
+  P0: On-the-fly per-expert weight dequant (~3.5GB -> 177MB reusable buffers)
+  P1: Expert loop in C++ (no Python GIL overhead, better GPU pipelining)
 
 Test:
     python tests/test_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py \
         --ref "solution/python/kernel00.py::kernel" \
-        --test "solution/cuda/binding.py::kernel" \
+        --test "solution/cuda/kernel00/binding.py::kernel" \
         --device cuda --T 1 4 16 64 256
 """
 
@@ -31,6 +35,7 @@ def _get_ops():
         _cuda_ops = load(
             name="moe_cuda_ops",
             sources=[str(_KERNEL_DIR / "kernel.cu")],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
             verbose=(os.environ.get("MOE_CUDA_VERBOSE", "0") == "1"),
         )
     return _cuda_ops
@@ -107,7 +112,7 @@ def kernel(
     device = hidden_states.device
     ops = _get_ops()
 
-    # ------- 1. Routing -------
+    # ------- 1. Routing (PyTorch) -------
     topk_idx, topk_weights = deepseek_v3_routing(
         routing_logits, routing_bias, routed_scaling_factor,
     )
@@ -138,7 +143,7 @@ def kernel(
     sort_idx = torch.argsort(local_expert_local, stable=True)
     sorted_expert = local_expert_local[sort_idx]
     sorted_token = local_token_flat[sort_idx]
-    sorted_weight = local_weight_flat[sort_idx]
+    sorted_weight = local_weight_flat[sort_idx].float()
 
     # Expert boundaries
     expert_counts = torch.zeros(E_LOCAL, dtype=torch.int64, device=device)
@@ -147,51 +152,23 @@ def kernel(
         torch.ones_like(sorted_expert, dtype=torch.int64),
     )
     expert_starts = torch.cumsum(expert_counts, dim=0) - expert_counts
-    total_tokens = sorted_token.numel()
 
-    # ------- 3. Fused FP8 dequant + gather (CUDA) -------
+    # ------- 3. Fused FP8 dequant + gather for hidden states (CUDA) -------
     A_gathered = ops.dequant_gather_forward(
         hidden_states, hidden_states_scale.float(),
         sorted_token, H, T, BLOCK,
     )  # [total_tokens, H] float32
 
-    # ------- 4. Pre-dequantize weights (PyTorch) -------
-    W1_fp32 = gemm1_weights.float()
-    S1 = gemm1_weights_scale.float()
-    S1_exp = S1.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=2)
-    W1 = W1_fp32 * S1_exp  # [E_LOCAL, 2I, H]
-
-    W2_fp32 = gemm2_weights.float()
-    S2 = gemm2_weights_scale.float()
-    S2_exp = S2.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=2)
-    W2 = W2_fp32 * S2_exp  # [E_LOCAL, H, I]
-
-    # ------- 5. Per-expert GEMM1 -> SwiGLU (CUDA) -> GEMM2 -------
-    result_buf = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
-
-    for le in range(E_LOCAL):
-        start = expert_starts[le].item()
-        count = expert_counts[le].item()
-        if count == 0:
-            continue
-        end = start + count
-
-        A_e = A_gathered[start:end]   # [count, H]
-        W1_e = W1[le]                 # [2I, H]
-        W2_e = W2[le]                 # [H, I]
-
-        # GEMM1: cuBLAS
-        G1 = A_e @ W1_e.t()  # [count, 2I]
-
-        # SwiGLU: CUDA kernel
-        C = ops.swiglu_forward(G1, I)  # [count, I]
-
-        # GEMM2: cuBLAS
-        result_buf[start:end] = C @ W2_e.t()  # [count, H]
-
-    # ------- 6. Weighted scatter-add (CUDA) -------
-    out_buf = torch.zeros((T, H), dtype=torch.float32, device=device)
-    ops.scatter_add_weighted_forward(result_buf, sorted_weight, sorted_token, out_buf)
+    # ------- 4. Grouped MoE: all experts in one C++ call -------
+    # Handles per-expert weight dequant + cuBLAS GEMM + SwiGLU + scatter-add
+    out_buf = ops.grouped_moe_forward(
+        A_gathered,
+        gemm1_weights, gemm1_weights_scale.float(),
+        gemm2_weights, gemm2_weights_scale.float(),
+        sorted_token, sorted_weight,
+        expert_starts, expert_counts,
+        T, H, I,
+    )
 
     result = out_buf.to(torch.bfloat16)
     if output is not None:
