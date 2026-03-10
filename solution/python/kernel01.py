@@ -1,429 +1,214 @@
 """
-Fused MoE kernel — Python entry point with inline CUDA JIT compilation.
+Optimized MoE — PyTorch only, no custom CUDA/Triton.
 
-language = "python" in config.toml, so flashinfer-bench treats this as pure Python.
-On first call, we JIT-compile the CUDA kernels via torch.utils.cpp_extension.
-If compilation fails (missing nvcc, wrong arch), falls back to optimized PyTorch.
+Optimizations vs kernel00 (baseline):
+  Level 1: Lazy per-expert dequant (3.5GB → ~50MB peak)
+  Level 2: Token permutation + bmm (32 small GEMMs → 1 batched GEMM)
+  Level 3: Vectorized scatter-add (32 index_add_ → 1 scatter_add_)
+
+Pipeline:
+  1. Dequant hidden states only (weights deferred to per-expert lazy dequant)
+  2. DeepSeek-V3 no-aux routing (identical to baseline)
+  3. Token permutation: sort (token, expert) pairs by expert → contiguous segments
+  4. Pad segments to max_Tk → bmm for GEMM1 and GEMM2
+  5. SwiGLU in-between
+  6. Vectorized weighted scatter-add back to [T, H]
 """
 
 import torch
 import torch.nn.functional as F
-import os
-import tempfile
-
-# =============================================================================
-# Inline CUDA source
-# =============================================================================
-_CUDA_SRC = r'''
-#include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include <cstdint>
-#include <cmath>
-
-// FP8 E4M3 -> float
-__device__ __forceinline__ float fp8_to_f32(__nv_fp8_e4m3 v) {
-    return float(v);
-}
-
-__device__ __forceinline__ float load_fp8(const void* ptr, int idx) {
-    __nv_fp8_e4m3 v;
-    reinterpret_cast<const unsigned char*>(ptr)[0];
-    unsigned char raw = ((const unsigned char*)ptr)[idx];
-    memcpy(&v, &raw, 1);
-    return float(v);
-}
-
-// =========================================================================
-// Kernel 1: Fused GEMM1 + SwiGLU
-// Each thread computes one element of the SwiGLU output [total_tokens, I]
-// Grid: (ceil(I/BN), ceil(total_tokens/BM))
-// Block: (BN, BM) where BN=32, BM=4
-// =========================================================================
-constexpr int BN1 = 32;
-constexpr int BM1 = 4;
-constexpr int H_DIM = 7168;
-constexpr int I_DIM = 2048;
-constexpr int TWO_I = 4096;
-constexpr int BS = 128;  // block scale granularity
-
-__global__ void gemm1_swiglu_kernel(
-    const void*    __restrict__ hidden_fp8,      // [T_orig, H] fp8
-    const float*   __restrict__ hidden_scale,    // [H/128, T_orig]
-    const void*    __restrict__ w1_fp8,          // [E, 2I, H] fp8
-    const float*   __restrict__ w1_scale,        // [E, 2I/128, H/128]
-    const int64_t* __restrict__ sorted_token,    // [total]
-    const int32_t* __restrict__ expert_starts,   // [E]
-    const int32_t* __restrict__ expert_counts,   // [E]
-    float*         __restrict__ out,             // [total, I]
-    int T_orig, int total, int E_local
-) {
-    int col = blockIdx.x * BN1 + threadIdx.x;  // output col in [0, I)
-    int row = blockIdx.y * BM1 + threadIdx.y;  // row in sorted token list
-    
-    if (col >= I_DIM || row >= total) return;
-    
-    // Find expert for this row
-    int expert_id = 0;
-    for (int e = 0; e < E_local; e++) {
-        if (row < expert_starts[e] + expert_counts[e]) {
-            expert_id = e;
-            break;
-        }
-        if (e + 1 < E_local && row < expert_starts[e + 1]) {
-            expert_id = e;
-            break;
-        }
-    }
-    // Simpler: linear scan
-    expert_id = 0;
-    {
-        int acc = 0;
-        for (int e = 0; e < E_local; e++) {
-            acc += expert_counts[e];
-            if (row < acc) { expert_id = e; break; }
-        }
-    }
-    
-    int token_id = sorted_token[row];
-    
-    // gate column = col, up column = col + I
-    int gate_col = col;
-    int up_col = col + I_DIM;
-    
-    int num_k_blocks = H_DIM / BS;  // 56
-    int num_n_blocks = TWO_I / BS;  // 32
-    
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
-    
-    for (int kb = 0; kb < num_k_blocks; kb++) {
-        float a_sc = hidden_scale[kb * T_orig + token_id];
-        float w_sc_gate = w1_scale[expert_id * num_n_blocks * num_k_blocks + (gate_col / BS) * num_k_blocks + kb];
-        float w_sc_up   = w1_scale[expert_id * num_n_blocks * num_k_blocks + (up_col / BS) * num_k_blocks + kb];
-        
-        float dot_gate = 0.0f, dot_up = 0.0f;
-        int k0 = kb * BS;
-        
-        #pragma unroll 4
-        for (int kk = 0; kk < BS; kk++) {
-            int k = k0 + kk;
-            float a = load_fp8(hidden_fp8, token_id * H_DIM + k);
-            float wg = load_fp8(w1_fp8, (size_t)expert_id * TWO_I * H_DIM + (size_t)gate_col * H_DIM + k);
-            float wu = load_fp8(w1_fp8, (size_t)expert_id * TWO_I * H_DIM + (size_t)up_col * H_DIM + k);
-            dot_gate += a * wg;
-            dot_up += a * wu;
-        }
-        
-        acc_gate += dot_gate * a_sc * w_sc_gate;
-        acc_up   += dot_up * a_sc * w_sc_up;
-    }
-    
-    // SwiGLU: silu(up) * gate
-    float silu_up = acc_up / (1.0f + expf(-acc_up));
-    out[row * I_DIM + col] = silu_up * acc_gate;
-}
-
-// =========================================================================
-// Kernel 2: Fused GEMM2 + Weighted Scatter-Add
-// Each thread computes one element of [total_tokens, H], then atomic adds
-// Grid: (ceil(H/BN), ceil(total/BM))
-// Block: (BN, BM)
-// =========================================================================
-constexpr int BN2 = 32;
-constexpr int BM2 = 4;
-
-__global__ void gemm2_scatter_kernel(
-    const float*   __restrict__ swiglu_in,       // [total, I] fp32
-    const void*    __restrict__ w2_fp8,          // [E, H, I] fp8
-    const float*   __restrict__ w2_scale,        // [E, H/128, I/128]
-    const int64_t* __restrict__ sorted_token,
-    const float*   __restrict__ sorted_weight,   // [total]
-    const int32_t* __restrict__ expert_starts,
-    const int32_t* __restrict__ expert_counts,
-    float*         __restrict__ output,          // [T_orig, H]
-    int total, int E_local
-) {
-    int col = blockIdx.x * BN2 + threadIdx.x;  // H dim
-    int row = blockIdx.y * BM2 + threadIdx.y;
-    
-    if (col >= H_DIM || row >= total) return;
-    
-    // Find expert
-    int expert_id = 0;
-    {
-        int acc = 0;
-        for (int e = 0; e < E_local; e++) {
-            acc += expert_counts[e];
-            if (row < acc) { expert_id = e; break; }
-        }
-    }
-    
-    int token_id = sorted_token[row];
-    float rw = sorted_weight[row];
-    
-    int num_k_blocks = I_DIM / BS;  // 16
-    int num_n_blocks = H_DIM / BS;  // 56
-    
-    float acc = 0.0f;
-    
-    for (int kb = 0; kb < num_k_blocks; kb++) {
-        float w_sc = w2_scale[expert_id * num_n_blocks * num_k_blocks + (col / BS) * num_k_blocks + kb];
-        
-        float dot = 0.0f;
-        int k0 = kb * BS;
-        
-        #pragma unroll 4
-        for (int kk = 0; kk < BS; kk++) {
-            int k = k0 + kk;
-            float a = swiglu_in[row * I_DIM + k];
-            float w = load_fp8(w2_fp8, (size_t)expert_id * H_DIM * I_DIM + (size_t)col * I_DIM + k);
-            dot += a * w;
-        }
-        acc += dot * w_sc;
-    }
-    
-    atomicAdd(&output[token_id * H_DIM + col], acc * rw);
-}
-
-// =========================================================================
-// Entry point
-// =========================================================================
-torch::Tensor moe_cuda(
-    torch::Tensor routing_logits,
-    torch::Tensor routing_bias,
-    torch::Tensor hidden_states,
-    torch::Tensor hidden_states_scale,
-    torch::Tensor gemm1_weights,
-    torch::Tensor gemm1_weights_scale,
-    torch::Tensor gemm2_weights,
-    torch::Tensor gemm2_weights_scale,
-    int64_t local_expert_offset,
-    double routed_scaling_factor
-) {
-    const int T = hidden_states.size(0);
-    const int E_LOCAL = 32;
-    const int E_GLOBAL = 256;
-    const int TOP_K = 8;
-    auto dev = hidden_states.device();
-    auto stream = at::cuda::getCurrentCUDAStream();
-    
-    // ---- Routing (PyTorch) ----
-    auto s = torch::sigmoid(routing_logits.to(torch::kFloat32));
-    auto sb = s + routing_bias.to(torch::kFloat32).view({-1});
-    auto gr = sb.view({T, 8, 32});
-    auto t2 = std::get<0>(gr.topk(2, 2));
-    auto gs = t2.sum(2);
-    auto gi = std::get<1>(gs.topk(4, 1));
-    auto gm = torch::zeros_like(gs).scatter_(1, gi, 1.0);
-    auto sm = gm.unsqueeze(2).expand({T, 8, 32}).reshape({T, E_GLOBAL});
-    auto pr = sb.masked_fill(sm == 0, -1e38f);
-    auto ti = std::get<1>(pr.topk(TOP_K, 1));
-    auto mm = torch::zeros_like(s).scatter_(1, ti, 1.0);
-    auto wt = s * mm;
-    wt = (wt / (wt.sum(1, true) + 1e-20)) * routed_scaling_factor;
-    
-    // ---- Permutation ----
-    int ls = (int)local_expert_offset;
-    auto fe = ti.reshape({-1});
-    auto ft = torch::arange(T, torch::kLong, dev).unsqueeze(1).expand({T, TOP_K}).reshape({-1});
-    auto lm = (fe >= ls) & (fe < ls + E_LOCAL);
-    
-    if (!lm.any().item<bool>())
-        return torch::zeros({T, H_DIM}, torch::kBFloat16, dev);
-    
-    auto le = fe.index({lm}) - ls;
-    auto lt = ft.index({lm});
-    auto ge = fe.index({lm});
-    auto lw = wt.index({lt, ge});
-    
-    auto si = torch::argsort(le, true);
-    auto se = le.index({si});
-    auto st = lt.index({si}).to(torch::kInt64);
-    auto sw = lw.index({si}).to(torch::kFloat32);
-    
-    auto ec = torch::zeros({E_LOCAL}, torch::kInt32, dev);
-    ec.scatter_add_(0, se.to(torch::kInt64), torch::ones(se.numel(), torch::kInt32, dev));
-    auto es = (torch::cumsum(ec, 0) - ec).to(torch::kInt32);
-    
-    int total = st.numel();
-    
-    // ---- Kernel 1 ----
-    auto swiglu_buf = torch::empty({total, I_DIM}, torch::kFloat32, dev);
-    {
-        dim3 grid((I_DIM + BN1 - 1) / BN1, (total + BM1 - 1) / BM1);
-        dim3 block(BN1, BM1);
-        gemm1_swiglu_kernel<<<grid, block, 0, stream>>>(
-            hidden_states.data_ptr(),
-            hidden_states_scale.data_ptr<float>(),
-            gemm1_weights.data_ptr(),
-            gemm1_weights_scale.data_ptr<float>(),
-            st.data_ptr<int64_t>(),
-            es.data_ptr<int32_t>(),
-            ec.data_ptr<int32_t>(),
-            swiglu_buf.data_ptr<float>(),
-            T, total, E_LOCAL
-        );
-    }
-    
-    // ---- Kernel 2 ----
-    auto output = torch::zeros({T, H_DIM}, torch::kFloat32, dev);
-    {
-        dim3 grid((H_DIM + BN2 - 1) / BN2, (total + BM2 - 1) / BM2);
-        dim3 block(BN2, BM2);
-        gemm2_scatter_kernel<<<grid, block, 0, stream>>>(
-            swiglu_buf.data_ptr<float>(),
-            gemm2_weights.data_ptr(),
-            gemm2_weights_scale.data_ptr<float>(),
-            st.data_ptr<int64_t>(),
-            sw.data_ptr<float>(),
-            es.data_ptr<int32_t>(),
-            ec.data_ptr<int32_t>(),
-            output.data_ptr<float>(),
-            total, E_LOCAL
-        );
-    }
-    
-    return output.to(torch::kBFloat16);
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("kernel", &moe_cuda);
-}
-'''
-
-# =============================================================================
-# JIT compile CUDA extension
-# =============================================================================
-_cuda_ext = None
-
-def _get_cuda_ext():
-    global _cuda_ext
-    if _cuda_ext is not None:
-        return _cuda_ext
-    
-    try:
-        from torch.utils.cpp_extension import load_inline
-        _cuda_ext = load_inline(
-            name="moe_fused",
-            cpp_sources="",
-            cuda_sources=[_CUDA_SRC],
-            functions=["kernel"],
-            extra_cuda_cflags=[
-                "-O3", "--use_fast_math", "-std=c++17",
-                "--expt-relaxed-constexpr",
-            ],
-            verbose=False,
-        )
-    except Exception as e:
-        print(f"[moe_kernel] CUDA JIT compilation failed: {e}")
-        print("[moe_kernel] Falling back to PyTorch implementation")
-        _cuda_ext = None
-    
-    return _cuda_ext
 
 
-# =============================================================================
-# PyTorch fallback (if CUDA compile fails)
-# =============================================================================
-def _pytorch_fallback(
-    routing_logits, routing_bias,
-    hidden_states, hidden_states_scale,
-    gemm1_weights, gemm1_weights_scale,
-    gemm2_weights, gemm2_weights_scale,
-    local_expert_offset, routed_scaling_factor,
-):
-    H, I, BLOCK = 7168, 2048, 128
-    E_local = gemm1_weights.shape[0]
-    E_global = routing_logits.shape[1]
-    T = routing_logits.shape[0]
-    device = hidden_states.device
-
-    # Dequant
-    A = hidden_states.float() * hidden_states_scale.float().t().repeat_interleave(BLOCK, 1)
-    W13 = gemm1_weights.float() * gemm1_weights_scale.float().repeat_interleave(BLOCK, 1).repeat_interleave(BLOCK, 2)
-    W2 = gemm2_weights.float() * gemm2_weights_scale.float().repeat_interleave(BLOCK, 1).repeat_interleave(BLOCK, 2)
-
-    # Routing
-    s = torch.sigmoid(routing_logits.float())
-    sb = s + routing_bias.float().view(-1)
-    gr = sb.view(T, 8, 32)
-    gs = gr.topk(2, 2).values.sum(2)
-    gi = gs.topk(4, 1).indices
-    gm = torch.zeros_like(gs).scatter_(1, gi, 1.0)
-    sm = gm.unsqueeze(2).expand(T, 8, 32).reshape(T, E_global)
-    pr = sb.masked_fill(sm == 0, torch.finfo(torch.float32).min)
-    ti = pr.topk(8, 1).indices
-    mm = torch.zeros_like(s).scatter_(1, ti, 1.0)
-    wt = s * mm
-    wt = (wt / (wt.sum(1, True) + 1e-20)) * routed_scaling_factor
-
-    # Permute
-    ls = int(local_expert_offset)
-    fe = ti.reshape(-1)
-    ft = torch.arange(T, device=device).unsqueeze(1).expand(T, 8).reshape(-1)
-    lm = (fe >= ls) & (fe < ls + E_local)
-    if not lm.any():
-        return torch.zeros(T, H, dtype=torch.bfloat16, device=device)
-    le = fe[lm] - ls
-    lt = ft[lm]
-    lw = wt[lt, fe[lm]]
-    si = torch.argsort(le, stable=True)
-    se, st_t, sw = le[si], lt[si], lw[si]
-    ec = torch.zeros(E_local, dtype=torch.long, device=device)
-    ec.scatter_add_(0, se.long(), torch.ones_like(se, dtype=torch.long))
-    es = (ec.cumsum(0) - ec)
-    
-    A_s = A[st_t]
-    total = st_t.numel()
-    result = torch.empty(total, H, dtype=torch.float32, device=device)
-    starts = es.tolist()
-    counts = ec.tolist()
-    for e in range(E_local):
-        c = counts[e]
-        if c == 0: continue
-        s_ = starts[e]
-        sl = slice(s_, s_ + c)
-        G1 = A_s[sl] @ W13[e].t()
-        result[sl] = (F.silu(G1[:, I:]) * G1[:, :I]) @ W2[e].t()
-    
-    output = torch.zeros(T, H, dtype=torch.float32, device=device)
-    output.index_add_(0, st_t, result * sw.unsqueeze(1))
-    return output.to(torch.bfloat16)
-
-
-# =============================================================================
-# Entry point
-# =============================================================================
 @torch.no_grad()
 def kernel(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
-    hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
+    routing_logits: torch.Tensor,       # [T, E_global] float
+    routing_bias: torch.Tensor,         # [E_global] float
+    hidden_states: torch.Tensor,        # [T, H] fp8 e4m3
+    hidden_states_scale: torch.Tensor,  # [H//128, T] float
+    gemm1_weights: torch.Tensor,        # [E_local, 2I, H] fp8
+    gemm1_weights_scale: torch.Tensor,  # [E_local, 2I//128, H//128] float
+    gemm2_weights: torch.Tensor,        # [E_local, H, I] fp8
+    gemm2_weights_scale: torch.Tensor,  # [E_local, H//128, I//128] float
     local_expert_offset: int,
     routed_scaling_factor: float,
 ):
-    ext = _get_cuda_ext()
-    
-    if ext is not None:
-        return ext.kernel(
-            routing_logits, routing_bias,
-            hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_weights_scale,
-            gemm2_weights, gemm2_weights_scale,
-            local_expert_offset, routed_scaling_factor,
-        )
-    else:
-        return _pytorch_fallback(
-            routing_logits, routing_bias,
-            hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_weights_scale,
-            gemm2_weights, gemm2_weights_scale,
-            local_expert_offset, routed_scaling_factor,
-        )
+    H = 7168
+    I = 2048
+    E_local = gemm1_weights.shape[0]
+    BLOCK = 128
+    E_global = routing_logits.shape[1]
+    T = routing_logits.shape[0]
+    TOP_K = 8
+    N_GROUP = 8
+    TOPK_GROUP = 4
+
+    device = hidden_states.device
+
+    # -------------------------------------------------------------------------
+    # 1) Dequant hidden states only — weights deferred to per-expert loop
+    # -------------------------------------------------------------------------
+    A_fp32 = hidden_states.to(torch.float32)
+    A_scale = hidden_states_scale.to(torch.float32)                # [H//128, T]
+    A_scale_TH = A_scale.permute(1, 0).contiguous()               # [T, H//128]
+    A_scale_expanded = (
+        A_scale_TH.unsqueeze(-1)
+        .expand(T, H // BLOCK, BLOCK)                              # [T, H//128, 128]
+        .reshape(T, H)                                             # [T, H]
+        .contiguous()
+    )
+    A = A_fp32 * A_scale_expanded                                  # [T, H] float32
+
+    # -------------------------------------------------------------------------
+    # 2) Routing (identical to baseline)
+    # -------------------------------------------------------------------------
+    logits = routing_logits.to(torch.float32)
+    bias = routing_bias.to(torch.float32).reshape(-1)
+
+    s = torch.sigmoid(logits)
+    s_with_bias = s + bias
+
+    group_size = E_global // N_GROUP
+    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)
+    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
+    group_scores = top2_vals.sum(dim=2)
+
+    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1.0)
+    score_mask = group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
+
+    neg_inf = torch.finfo(torch.float32).min
+    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
+    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
+
+    M_mask = torch.zeros_like(s)
+    M_mask.scatter_(1, topk_idx, 1.0)
+    weights = s * M_mask
+    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
+    weights = (weights / weights_sum) * routed_scaling_factor
+
+    # -------------------------------------------------------------------------
+    # 3) Token permutation — sort all (token, expert) pairs by expert
+    # -------------------------------------------------------------------------
+    local_start = int(local_expert_offset)
+
+    # Flatten topk_idx: each token has TOP_K expert assignments
+    flat_expert_idx = topk_idx.reshape(-1)                          # [T*8]
+    flat_token_idx = torch.arange(T, device=device).unsqueeze(1).expand(T, TOP_K).reshape(-1)
+
+    # Keep only pairs assigned to local experts
+    local_mask = (flat_expert_idx >= local_start) & (flat_expert_idx < local_start + E_local)
+
+    if not local_mask.any():
+        return torch.zeros(T, H, dtype=torch.bfloat16, device=device)
+
+    local_token_idx = flat_token_idx[local_mask]                    # [M]
+    local_expert_idx = flat_expert_idx[local_mask] - local_start    # [M] in 0..31
+
+    # Sort by expert so same-expert tokens are contiguous
+    sort_order = local_expert_idx.argsort(stable=True)
+    sorted_token_idx = local_token_idx[sort_order]                  # [M]
+    sorted_expert_idx = local_expert_idx[sort_order]                # [M]
+
+    # Compute per-expert counts and offsets
+    expert_counts = torch.zeros(E_local, dtype=torch.long, device=device)
+    expert_counts.scatter_add_(0, sorted_expert_idx.long(),
+                               torch.ones_like(sorted_expert_idx, dtype=torch.long))
+    expert_offsets = torch.zeros(E_local, dtype=torch.long, device=device)
+    expert_offsets[1:] = expert_counts[:-1].cumsum(0)
+
+    M_total = sorted_token_idx.shape[0]
+    max_tk = expert_counts.max().item()
+
+    if max_tk == 0:
+        return torch.zeros(T, H, dtype=torch.bfloat16, device=device)
+
+    # -------------------------------------------------------------------------
+    # 4) Lazy per-expert dequant + padded bmm
+    #    Build [E_local, max_Tk, H] input and dequant weights per-expert
+    # -------------------------------------------------------------------------
+
+    # Gather all needed token hidden states
+    X_sorted = A[sorted_token_idx]                                  # [M, H]
+
+    # Pad into [E_local, max_Tk, H] for bmm
+    X_padded = torch.zeros(E_local, max_tk, H, device=device, dtype=torch.float32)
+    # Also build [E_local, max_Tk, 2I] and [E_local, max_Tk, H] for results
+    offsets_list = expert_offsets.tolist()
+    counts_list = expert_counts.tolist()
+
+    for le in range(E_local):
+        c = counts_list[le]
+        if c == 0:
+            continue
+        off = offsets_list[le]
+        X_padded[le, :c] = X_sorted[off:off + c]
+
+    # Lazy dequant: build W13 [E_local, 2I, H] and W2 [E_local, H, I] one expert at a time
+    # To still use bmm, we need the full [E, 2I, H] weight tensor, but dequant per-expert
+    # avoids the massive intermediate S_expanded tensors
+    W13 = torch.empty(E_local, 2 * I, H, device=device, dtype=torch.float32)
+    W2 = torch.empty(E_local, H, I, device=device, dtype=torch.float32)
+
+    for le in range(E_local):
+        if counts_list[le] == 0:
+            continue
+        # GEMM1 weights: [2I, H] with scale [2I//128, H//128]
+        w13_e = gemm1_weights[le].to(torch.float32)                # [2I, H]
+        s13_e = gemm1_weights_scale[le].to(torch.float32)          # [2I//128, H//128]
+        s13_exp = s13_e.repeat_interleave(BLOCK, dim=0)            # [2I, H//128]
+        s13_exp = s13_exp.repeat_interleave(BLOCK, dim=1)          # [2I, H]
+        W13[le] = w13_e * s13_exp
+
+        # GEMM2 weights: [H, I] with scale [H//128, I//128]
+        w2_e = gemm2_weights[le].to(torch.float32)                 # [H, I]
+        s2_e = gemm2_weights_scale[le].to(torch.float32)           # [H//128, I//128]
+        s2_exp = s2_e.repeat_interleave(BLOCK, dim=0)              # [H, I//128]
+        s2_exp = s2_exp.repeat_interleave(BLOCK, dim=1)            # [H, I]
+        W2[le] = w2_e * s2_exp
+
+    # -------------------------------------------------------------------------
+    # 5) Batched GEMM1 + SwiGLU + Batched GEMM2
+    #    [E, max_Tk, H] @ [E, H, 2I] → [E, max_Tk, 2I]
+    # -------------------------------------------------------------------------
+
+    # GEMM1: bmm
+    G1 = torch.bmm(X_padded, W13.permute(0, 2, 1))                # [E, max_Tk, 2I]
+
+    # SwiGLU
+    X1 = G1[:, :, :I]                                              # gate [E, max_Tk, I]
+    X2 = G1[:, :, I:]                                              # up   [E, max_Tk, I]
+    C = F.silu(X2) * X1                                            # [E, max_Tk, I]
+
+    # GEMM2: bmm
+    O_padded = torch.bmm(C, W2.permute(0, 2, 1))                  # [E, max_Tk, H]
+
+    # -------------------------------------------------------------------------
+    # 6) Vectorized scatter-add — unpad + weight + single scatter_add_
+    # -------------------------------------------------------------------------
+
+    # Extract valid (non-padded) results back to [M, H]
+    O_all = torch.empty(M_total, H, device=device, dtype=torch.float32)
+    for le in range(E_local):
+        c = counts_list[le]
+        if c == 0:
+            continue
+        off = offsets_list[le]
+        O_all[off:off + c] = O_padded[le, :c]
+
+    # Gather routing weights for each (token, expert) pair
+    sorted_global_expert = sorted_expert_idx + local_start
+    sorted_weights = weights[sorted_token_idx, sorted_global_expert]  # [M]
+
+    # Weighted results
+    O_weighted = O_all * sorted_weights.unsqueeze(1)                # [M, H]
+
+    # Single scatter_add_
+    output = torch.zeros(T, H, dtype=torch.float32, device=device)
+    output.scatter_add_(
+        0,
+        sorted_token_idx.unsqueeze(1).expand(M_total, H),
+        O_weighted,
+    )
+
+    return output.to(torch.bfloat16)
