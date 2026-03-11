@@ -5,4 +5,4 @@ author = "kobernel"              # Team/author name
 
 [build]
 language = "python"               # triton | cuda
-entry_point = "kernel02.py::kernel"            # Kernel function name
+entry_point = "kernel03.py::kernel"            # Kernel function name
